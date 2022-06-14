@@ -655,16 +655,10 @@ func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBu
 
 		// Save objects' metadata in `fs.json`.
 		fsMeta := newFSMetaV1()
-		if _, err = fsMeta.ReadFrom(ctx, wlk); err != nil {
-			// For any error to read fsMeta, set default ETag and proceed.
-			fsMeta = fs.defaultFsJSON(srcObject)
-		}
+		fsMeta = fs.defaultFsJSON(srcObject)
 
 		fsMeta.Meta = cloneMSS(srcInfo.UserDefined)
 		fsMeta.Meta["etag"] = srcInfo.ETag
-		if _, err = fsMeta.WriteTo(wlk); err != nil {
-			return oi, toObjectErr(err, srcBucket, srcObject)
-		}
 
 		fsObjectPath := pathJoin(fs.fsPath, srcBucket, srcObject)
 
@@ -797,22 +791,6 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	return objReaderFn(reader, h, closeFn, rwPoolUnlocker, nsUnlocker)
 }
 
-// Create a new fs.json file, if the existing one is corrupt. Should happen very rarely.
-func (fs *FSObjects) createFsJSON(object, fsMetaPath string) error {
-	fsMeta := newFSMetaV1()
-	fsMeta.Meta = map[string]string{
-		"etag":         GenETag(),
-		"content-type": mimedb.TypeByExtension(path.Ext(object)),
-	}
-	wlk, werr := fs.rwPool.Create(fsMetaPath)
-	if werr == nil {
-		_, err := fsMeta.WriteTo(wlk)
-		wlk.Close()
-		return err
-	}
-	return werr
-}
-
 // Used to return default etag values when a pre-existing object's meta data is queried.
 func (fs *FSObjects) defaultFsJSON(object string) fsMetaV1 {
 	fsMeta := newFSMetaV1()
@@ -897,32 +875,7 @@ func (fs *FSObjects) getObjectInfo(ctx context.Context, bucket, object string) (
 		return fsMeta.ToObjectInfo(bucket, object, fi), nil
 	}
 
-	fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
-	// Read `fs.json` to perhaps contend with
-	// parallel Put() operations.
-
-	rlk, err := fs.rwPool.Open(fsMetaPath)
-	if err == nil {
-		// Read from fs metadata only if it exists.
-		_, rerr := fsMeta.ReadFrom(ctx, rlk.LockedFile)
-		fs.rwPool.Close(fsMetaPath)
-		if rerr != nil {
-			// For any error to read fsMeta, set default ETag and proceed.
-			fsMeta = fs.defaultFsJSON(object)
-		}
-	}
-
-	// Return a default etag and content-type based on the object's extension.
-	if err == errFileNotFound {
-		fsMeta = fs.defaultFsJSON(object)
-	}
-
-	// Ignore if `fs.json` is not available, this is true for pre-existing data.
-	if err != nil && err != errFileNotFound {
-		logger.LogIf(ctx, err)
-		return oi, err
-	}
-
+	fsMeta = fs.defaultFsJSON(object)
 	// Stat the file to get file size.
 	fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object))
 	if err != nil {
@@ -975,13 +928,7 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 		if err != nil {
 			return oi, toObjectErr(err, bucket, object)
 		}
-
-		fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
-		err = fs.createFsJSON(object, fsMetaPath)
 		lk.Unlock(lkctx.Cancel)
-		if err != nil {
-			return oi, toObjectErr(err, bucket, object)
-		}
 
 		oi, err = fs.getObjectInfoWithLock(ctx, bucket, object)
 		return oi, toObjectErr(err, bucket, object)
@@ -1111,13 +1058,6 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	fsNSObjPath := pathJoin(fs.fsPath, bucket, object)
 	if err = fsRenameFile(ctx, fsTmpObjPath, fsNSObjPath); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
-	}
-
-	if bucket != minioMetaBucket {
-		// Write FS metadata after a successful namespace operation.
-		if _, err = fsMeta.WriteTo(wlk); err != nil {
-			return ObjectInfo{}, toObjectErr(err, bucket, object)
-		}
 	}
 
 	// Stat the file to fetch timestamp, size.
@@ -1328,23 +1268,8 @@ func (fs *FSObjects) PutObjectTags(ctx context.Context, bucket, object string, t
 	// This close will allow for locks to be synchronized on `fs.json`.
 	defer wlk.Close()
 
-	// Read objects' metadata in `fs.json`.
-	if _, err = fsMeta.ReadFrom(ctx, wlk); err != nil {
-		// For any error to read fsMeta, set default ETag and proceed.
-		fsMeta = fs.defaultFsJSON(object)
-	}
-
 	// clean fsMeta.Meta of tag key, before updating the new tags
 	delete(fsMeta.Meta, xhttp.AmzObjectTagging)
-
-	// Do not update for empty tags
-	if tags != "" {
-		fsMeta.Meta[xhttp.AmzObjectTagging] = tags
-	}
-
-	if _, err = fsMeta.WriteTo(wlk); err != nil {
-		return ObjectInfo{}, toObjectErr(err, bucket, object)
-	}
 
 	// Stat the file to get file size.
 	fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object))
