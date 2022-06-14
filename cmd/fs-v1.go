@@ -22,7 +22,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/user"
@@ -41,7 +40,6 @@ import (
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/config"
 	xhttp "github.com/minio/minio/internal/http"
-	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/lock"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mountinfo"
@@ -363,25 +361,8 @@ func (fs *FSObjects) scanBucket(ctx context.Context, bucket string, cache dataUs
 	// Load bucket info.
 	cache, err = scanDataFolder(ctx, -1, -1, fs.fsPath, cache, func(item scannerItem) (sizeSummary, error) {
 		bucket, object := item.bucket, item.objectPath()
-		fsMetaBytes, err := xioutil.ReadFile(pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile))
-		if err != nil && !osIsNotExist(err) {
-			if intDataUpdateTracker.debug {
-				logger.Info(color.Green("scanBucket:")+" object return unexpected error: %v/%v: %w", item.bucket, item.objectPath(), err)
-			}
-			return sizeSummary{}, errSkipFile
-		}
-
 		fsMeta := newFSMetaV1()
-		metaOk := false
-		if len(fsMetaBytes) > 0 {
-			json := jsoniter.ConfigCompatibleWithStandardLibrary
-			if err = json.Unmarshal(fsMetaBytes, &fsMeta); err == nil {
-				metaOk = true
-			}
-		}
-		if !metaOk {
-			fsMeta = fs.defaultFsJSON(object)
-		}
+		fsMeta = fs.defaultFsJSON(object)
 
 		// Stat the file.
 		fi, fiErr := os.Stat(item.Path)
@@ -641,17 +622,6 @@ func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBu
 	}
 
 	if cpSrcDstSame && srcInfo.metadataOnly {
-		fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, srcBucket, srcObject, fs.metaJSONFile)
-		wlk, err := fs.rwPool.Write(fsMetaPath)
-		if err != nil {
-			wlk, err = fs.rwPool.Create(fsMetaPath)
-			if err != nil {
-				logger.LogIf(ctx, err)
-				return oi, toObjectErr(err, srcBucket, srcObject)
-			}
-		}
-		// This close will allow for locks to be synchronized on `fs.json`.
-		defer wlk.Close()
 
 		// Save objects' metadata in `fs.json`.
 		fsMeta := newFSMetaV1()
@@ -744,18 +714,6 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	}
 	// Take a rwPool lock for NFS gateway type deployment
 	rwPoolUnlocker := func() {}
-	if bucket != minioMetaBucket && lockType != noLock {
-		fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
-		_, err = fs.rwPool.Open(fsMetaPath)
-		if err != nil && err != errFileNotFound {
-			logger.LogIf(ctx, err)
-			nsUnlocker()
-			return nil, toObjectErr(err, bucket, object)
-		}
-		// Need to clean up lock after getObject is
-		// completed.
-		rwPoolUnlocker = func() { fs.rwPool.Close(fsMetaPath) }
-	}
 
 	objReaderFn, off, length, err := NewGetObjectReader(rs, objInfo, opts)
 	if err != nil {
@@ -820,37 +778,7 @@ func (fs *FSObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object s
 		return fsMeta.ToObjectInfo(bucket, object, fi), nil
 	}
 
-	fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
-	// Read `fs.json` to perhaps contend with
-	// parallel Put() operations.
-
-	rc, _, err := fsOpenFile(ctx, fsMetaPath, 0)
-	if err == nil {
-		fsMetaBuf, rerr := ioutil.ReadAll(rc)
-		rc.Close()
-		if rerr == nil {
-			json := jsoniter.ConfigCompatibleWithStandardLibrary
-			if rerr = json.Unmarshal(fsMetaBuf, &fsMeta); rerr != nil {
-				// For any error to read fsMeta, set default ETag and proceed.
-				fsMeta = fs.defaultFsJSON(object)
-			}
-		} else {
-			// For any error to read fsMeta, set default ETag and proceed.
-			fsMeta = fs.defaultFsJSON(object)
-		}
-	}
-
-	// Return a default etag and content-type based on the object's extension.
-	if err == errFileNotFound {
-		fsMeta = fs.defaultFsJSON(object)
-	}
-
-	// Ignore if `fs.json` is not available, this is true for pre-existing data.
-	if err != nil && err != errFileNotFound {
-		logger.LogIf(ctx, err)
-		return oi, err
-	}
-
+	fsMeta = fs.defaultFsJSON(object)
 	// Stat the file to get file size.
 	fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object))
 	if err != nil {
@@ -1001,35 +929,6 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 		return ObjectInfo{}, errInvalidArgument
 	}
 
-	var wlk *lock.LockedFile
-	if bucket != minioMetaBucket {
-		bucketMetaDir := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix)
-		fsMetaPath := pathJoin(bucketMetaDir, bucket, object, fs.metaJSONFile)
-		wlk, err = fs.rwPool.Write(fsMetaPath)
-		var freshFile bool
-		if err != nil {
-			wlk, err = fs.rwPool.Create(fsMetaPath)
-			if err != nil {
-				logger.LogIf(ctx, err)
-				return ObjectInfo{}, toObjectErr(err, bucket, object)
-			}
-			freshFile = true
-		}
-		// This close will allow for locks to be synchronized on `fs.json`.
-		defer wlk.Close()
-		defer func() {
-			// Remove meta file when PutObject encounters
-			// any error and it is a fresh file.
-			//
-			// We should preserve the `fs.json` of any
-			// existing object
-			if retErr != nil && freshFile {
-				tmpDir := pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID)
-				fsRemoveMeta(ctx, bucketMetaDir, fsMetaPath, tmpDir)
-			}
-		}()
-	}
-
 	// Uploaded object will first be written to the temporary location which will eventually
 	// be renamed to the actual location. It is first written to the temporary location
 	// so that cleaning it up will be easy if the server goes down.
@@ -1127,16 +1026,6 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 
 	var rwlk *lock.LockedFile
 
-	minioMetaBucketDir := pathJoin(fs.fsPath, minioMetaBucket)
-	fsMetaPath := pathJoin(minioMetaBucketDir, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
-	if bucket != minioMetaBucket {
-		rwlk, err = fs.rwPool.Write(fsMetaPath)
-		if err != nil && err != errFileNotFound {
-			logger.LogIf(ctx, err)
-			return objInfo, toObjectErr(err, bucket, object)
-		}
-	}
-
 	// Delete the object.
 	if err = fsDeleteFile(ctx, pathJoin(fs.fsPath, bucket), pathJoin(fs.fsPath, bucket, object)); err != nil {
 		if rwlk != nil {
@@ -1150,13 +1039,6 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 		rwlk.Close()
 	}
 
-	if bucket != minioMetaBucket {
-		// Delete the metadata object.
-		err = fsDeleteFile(ctx, minioMetaBucketDir, fsMetaPath)
-		if err != nil && err != errFileNotFound {
-			return objInfo, toObjectErr(err, bucket, object)
-		}
-	}
 	return ObjectInfo{Bucket: bucket, Name: object}, nil
 }
 
@@ -1255,19 +1137,7 @@ func (fs *FSObjects) PutObjectTags(ctx context.Context, bucket, object string, t
 		}
 	}
 
-	fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
 	fsMeta := fsMetaV1{}
-	wlk, err := fs.rwPool.Write(fsMetaPath)
-	if err != nil {
-		wlk, err = fs.rwPool.Create(fsMetaPath)
-		if err != nil {
-			logger.LogIf(ctx, err)
-			return ObjectInfo{}, toObjectErr(err, bucket, object)
-		}
-	}
-	// This close will allow for locks to be synchronized on `fs.json`.
-	defer wlk.Close()
-
 	// clean fsMeta.Meta of tag key, before updating the new tags
 	delete(fsMeta.Meta, xhttp.AmzObjectTagging)
 
